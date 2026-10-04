@@ -106,23 +106,33 @@ func TestRequestAdjustAndRelease(t *testing.T) {
 }
 
 func TestFaultRecoveryNoDoubleCount(t *testing.T) {
-	// 模拟故障（预算被压到 0）再恢复（预算回升）：已持有预留不得重复计入。
+	// 模拟故障（预算被压到 0）再恢复（预算回升）：
+	// 收紧时全部预留被立即收清、不留残留占用；恢复后额度干净可用、不重不漏。
 	m := NewManager(100)
 	m.Request(Unit{ID: "drive", Priority: 1, RequestW: 50, MinW: 10})
 	m.Request(Unit{ID: "fan", Priority: 2, RequestW: 20, MinW: 5})
 	m.SetBudget(0)
-	t.Logf("[fault] budget=0 reserved=%.1f (existing holds kept until released)", m.Snapshot().ReservedW)
-
-	// 故障期间释放一个单元。
-	if rel := m.Release("fan"); rel != 20 {
-		t.Fatalf("release during fault returned %.1f", rel)
+	snap := m.Snapshot()
+	t.Logf("[fault] budget=0 reserved=%.1f remaining=%.1f (tightening reclaims all holds immediately)",
+		snap.ReservedW, snap.RemainingW)
+	if snap.ReservedW != 0 || snap.RemainingW != 0 || len(snap.Granted) != 0 {
+		t.Fatalf("fault to zero must reclaim all holds, got %+v", snap)
 	}
-	// 恢复预算。
+
+	// 故障期间释放：预留已被收清，释放为空操作，不会重复扣减。
+	if rel := m.Release("fan"); rel != 0 {
+		t.Fatalf("release after reclaim must be no-op, returned %.1f", rel)
+	}
+	// 恢复预算：额度干净可用，重新申请足额授予、只计一次。
 	m.SetBudget(100)
+	g := m.Request(Unit{ID: "drive", Priority: 1, RequestW: 50, MinW: 10})
+	if g.Status != StatusGranted || g.PowerW != 50 {
+		t.Fatalf("re-request after recovery failed: %+v", g)
+	}
 	a := m.Snapshot()
 	t.Logf("[recover] reserved=%.1f remaining=%.1f grants=%d", a.ReservedW, a.RemainingW, len(a.Granted))
 	if len(a.Granted) != 1 || a.Granted[0].UnitID != "drive" || a.ReservedW != 50 {
-		t.Fatalf("after recovery only drive/50W should remain, got %+v", a.Granted)
+		t.Fatalf("after recovery only drive/50W should be held, got %+v", a.Granted)
 	}
 	checkConservation(t, a)
 }

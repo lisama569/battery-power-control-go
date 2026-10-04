@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
 
 // eps 用于功率比较，消除浮点尾差导致的抖动。
@@ -43,13 +44,15 @@ type Grant struct {
 	Reason string
 }
 
-// reservation 是某单元当前持有的预留，连同最近一次授予状态一起保存，
-// 使快照能区分足额与降级授予。
+// reservation 是某单元当前持有的预留，连同最近一次授予状态与原始申请参数
+// 一起保存：快照能区分足额与降级授予，增援到期/收紧回收也能按原始申请归还或重算。
 type reservation struct {
 	priority int
 	powerW   float64
 	status   GrantStatus
 	reason   string
+	reqW     float64 // 原始申请功率
+	minW     float64 // 原始降级下限
 }
 
 // Allocation 是一轮分配的完整快照。
@@ -58,6 +61,7 @@ type Allocation struct {
 	Granted      []Grant
 	ReservedW    float64
 	RemainingW   float64
+	Boosts       []Boost // 当前仍在窗口期内的增援，按 (优先级, ID) 确定排序
 }
 
 // Manager 管理总预算与各单元预留。所有方法均并发安全且原子。
@@ -65,6 +69,8 @@ type Manager struct {
 	mu     sync.Mutex
 	totalW float64
 	held   map[string]reservation
+	boosts map[string]boostState
+	nowFn  func() time.Time // 时钟可注入，测试与管线用固定时间保证可复现
 }
 
 // NewManager 构造预算管理器。
@@ -72,7 +78,22 @@ func NewManager(totalBudgetW float64) *Manager {
 	if totalBudgetW < 0 {
 		totalBudgetW = 0
 	}
-	return &Manager{totalW: totalBudgetW, held: make(map[string]reservation)}
+	return &Manager{
+		totalW: totalBudgetW,
+		held:   make(map[string]reservation),
+		boosts: make(map[string]boostState),
+		nowFn:  time.Now,
+	}
+}
+
+// SetClock 注入时钟（默认 time.Now）。管线与测试用它驱动增援到期，
+// 保证同一串输入重复运行结论完全一致。
+func (m *Manager) SetClock(nowFn func() time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if nowFn != nil {
+		m.nowFn = nowFn
+	}
 }
 
 // reservedLocked 计算当前已预留总额。
@@ -109,11 +130,29 @@ func (m *Manager) snapshotLocked() Allocation {
 		})
 		reserved += r.powerW
 	}
+	boosts := make([]Boost, 0, len(m.boosts))
+	for _, id := range ids {
+		b, ok := m.boosts[id]
+		if !ok {
+			continue
+		}
+		boosts = append(boosts, Boost{
+			UnitID:    id,
+			Priority:  m.held[id].priority,
+			PowerW:    m.held[id].powerW,
+			ExpiresAt: b.expiresAt,
+		})
+	}
+	remaining := m.totalW - reserved
+	if remaining < 0 && remaining > -1e-6 {
+			remaining = 0 // 浮点尾差钳位，剩余额度对外永不为负
+	}
 	return Allocation{
 		TotalBudgetW: m.totalW,
 		Granted:      grants,
 		ReservedW:    reserved,
-		RemainingW:   m.totalW - reserved,
+		RemainingW:   remaining,
+		Boosts:       boosts,
 	}
 }
 
@@ -121,15 +160,25 @@ func (m *Manager) snapshotLocked() Allocation {
 func (m *Manager) Snapshot() Allocation {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.sweepLocked(m.nowFn())
 	return m.snapshotLocked()
 }
 
 // Request 原子地为单元申请/调整功率预留。
 // 预算不足时：可用量 >= MinW 则降级授予，否则拒绝（不改变其原有预留）。
+// 若该单元持有生效中的增援，普通申请视为提前结束增援：先归还被挤占额度再按普通申请处理。
 func (m *Manager) Request(u Unit) Grant {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.sweepLocked(m.nowFn())
+	if _, ok := m.boosts[u.ID]; ok {
+		m.cancelBoostLocked(u.ID)
+	}
+	return m.requestLocked(u)
+}
 
+// requestLocked 是 Request 的持锁内部实现，也用于增援到期后的归还重算。
+func (m *Manager) requestLocked(u Unit) Grant {
 	if u.RequestW < 0 {
 		u.RequestW = 0
 	}
@@ -150,6 +199,8 @@ func (m *Manager) Request(u Unit) Grant {
 		m.held[u.ID] = reservation{
 			priority: u.Priority, powerW: u.RequestW, status: StatusGranted,
 			reason: fmt.Sprintf("requested %.1fW within available %.1fW", u.RequestW, available),
+			reqW:   u.RequestW,
+			minW:   u.MinW,
 		}
 		g.Status = StatusGranted
 		g.PowerW = u.RequestW
@@ -160,6 +211,8 @@ func (m *Manager) Request(u Unit) Grant {
 			priority: u.Priority, powerW: granted, status: StatusDegraded,
 			reason: fmt.Sprintf("budget short: available %.1fW < requested %.1fW, degraded above min %.1fW",
 				available, u.RequestW, u.MinW),
+			reqW: u.RequestW,
+			minW: u.MinW,
 		}
 		g.Status = StatusDegraded
 		g.PowerW = granted
@@ -177,10 +230,17 @@ func (m *Manager) Request(u Unit) Grant {
 }
 
 // Release 释放单元持有的预留；对未持有单元为空操作（幂等）。
+// 若该单元持有生效中的增援，释放即提前结束增援：增援预留移除、被挤占额度归还。
 // 返回实际释放的瓦数，便于调用方在日志中核对。
 func (m *Manager) Release(unitID string) float64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.sweepLocked(m.nowFn())
+	if _, ok := m.boosts[unitID]; ok {
+		released := m.held[unitID].powerW
+		m.cancelBoostLocked(unitID)
+		return released
+	}
 	r, ok := m.held[unitID]
 	if !ok {
 		return 0
@@ -192,13 +252,20 @@ func (m *Manager) Release(unitID string) float64 {
 // Allocate 对一批申请做一轮原子的优先级分配。
 // 该方法只在本轮预算内授予，不触碰本轮之外已有的其他单元预留；
 // 对出现在本轮列表里的单元，则以本轮申请替换其旧预留。
+// 例外：持有生效中增援的单元即使出现在本轮列表里也跳过，其预留由增援管理。
 // 排序：优先级升序，同优先级按 ID 升序（结果可复现）。
 func (m *Manager) Allocate(units []Unit) Allocation {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.sweepLocked(m.nowFn())
 
-	ordered := make([]Unit, len(units))
-	copy(ordered, units)
+	ordered := make([]Unit, 0, len(units))
+	for _, u := range units {
+		if _, ok := m.boosts[u.ID]; ok {
+			continue // 增援窗口内该单元预留由增援管理，本轮不覆盖
+		}
+		ordered = append(ordered, u)
+	}
 	sort.SliceStable(ordered, func(i, j int) bool {
 		if ordered[i].Priority != ordered[j].Priority {
 			return ordered[i].Priority < ordered[j].Priority
@@ -227,6 +294,8 @@ func (m *Manager) Allocate(units []Unit) Allocation {
 			m.held[u.ID] = reservation{
 				priority: u.Priority, powerW: req, status: StatusGranted,
 				reason: fmt.Sprintf("priority allocation: %.1fW of requested %.1fW", req, req),
+				reqW:   req,
+				minW:   minW,
 			}
 			available -= req
 		case available+eps >= minW:
@@ -234,6 +303,8 @@ func (m *Manager) Allocate(units []Unit) Allocation {
 				priority: u.Priority, powerW: available, status: StatusDegraded,
 				reason: fmt.Sprintf("priority allocation degraded to %.1fW (requested %.1fW, min %.1fW)",
 					available, req, minW),
+				reqW: req,
+				minW: minW,
 			}
 			available = 0
 		default:
@@ -244,7 +315,11 @@ func (m *Manager) Allocate(units []Unit) Allocation {
 }
 
 // SetBudget 调整总预算（例如限功率结论变化后），单位瓦。
-// 已持有预留不立即回收，新预算在后续 Request/Allocate 中生效。
+// 预算下调时立即按“优先级从低到高（同优先级按 ID 逆序）”回收已持有预留，
+// 直到满足 ReservedW <= TotalBudgetW：边界单元回收差额（不低于其 MinW，
+// 否则整笔收回），更低优先级单元整笔收回。因此任何时刻剩余额度不为负、
+// 总量/已占用/剩余三者守恒；故障把预算打到 0 时全部预留被收清，不留残留占用。
+// 被收回的单元可在后续 Request/Allocate 中按新预算重新申请。
 func (m *Manager) SetBudget(totalW float64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -252,6 +327,49 @@ func (m *Manager) SetBudget(totalW float64) {
 		totalW = 0
 	}
 	m.totalW = totalW
+	m.sweepLocked(m.nowFn()) // 到期增援按新预算归还
+	m.reclaimLocked()
+}
+
+// reclaimLocked 在预算收紧后按优先级从低到高回收预留，直到恢复守恒。
+func (m *Manager) reclaimLocked() {
+	for {
+		excess := m.reservedLocked() - m.totalW
+		if excess <= eps {
+			return
+		}
+		id := m.lowestPriorityHolderLocked()
+		if id == "" {
+			return
+		}
+		r := m.held[id]
+		newPower := r.powerW - excess
+		if newPower > eps && newPower+eps >= r.minW {
+			r.powerW = newPower
+			r.status = StatusDegraded
+			r.reason = fmt.Sprintf("budget tightened to %.1fW: reclaimed %.1fW by priority",
+				m.totalW, excess)
+			m.held[id] = r
+		} else {
+			delete(m.held, id) // 差额会击穿其 MinW：整笔收回
+		}
+	}
+}
+
+// lowestPriorityHolderLocked 返回当前优先级最低（数值最大；同优先级 ID 逆序）的持有单元。
+func (m *Manager) lowestPriorityHolderLocked() string {
+	best := ""
+	for id, r := range m.held {
+		if best == "" {
+			best = id
+			continue
+		}
+		br := m.held[best]
+		if r.priority > br.priority || (r.priority == br.priority && id > best) {
+			best = id
+		}
+	}
+	return best
 }
 
 // TotalBudget 返回当前总预算。

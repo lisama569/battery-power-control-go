@@ -49,6 +49,8 @@ type Report struct {
 
 // Pipeline 持有整条管线的状态。Evaluate 全程持锁，
 // 保证“限功率结论 → 总预算 → 分配快照”三者作为一个一致原子对外可见。
+// now 是管线最近一次从调用方获得的时间，作为预算管理器的时钟驱动增援到期，
+// 因此同一串输入（样本 + 时间戳）重复运行结论完全一致。
 type Pipeline struct {
 	mu        sync.Mutex
 	validator *sensor.Validator
@@ -56,6 +58,7 @@ type Pipeline struct {
 	engine    *limits.Engine
 	manager   *budget.Manager
 	cfg       Config
+	now       time.Time
 }
 
 // New 按配置构造管线。
@@ -63,13 +66,15 @@ func New(cfg Config) *Pipeline {
 	v := sensor.NewValidator(cfg.Specs)
 	e := sensor.NewEstimator(cfg.CapacityAh, cfg.Specs)
 	e.Reset(cfg.InitialSOC)
-	return &Pipeline{
+	p := &Pipeline{
 		validator: v,
 		estimator: e,
 		engine:    limits.NewEngine(cfg.RatedPowerW, cfg.RatedTorqueNm),
 		manager:   budget.NewManager(cfg.RatedPowerW),
 		cfg:       cfg,
 	}
+	p.manager.SetClock(func() time.Time { return p.now })
+	return p
 }
 
 // Ingest 接收一条样本：通过校验才送入估计器；否则记录拒绝原因。
@@ -77,6 +82,7 @@ func New(cfg Config) *Pipeline {
 func (p *Pipeline) Ingest(s sensor.Sample, now time.Time) sensor.Verdict {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.now = now
 	verdict := p.validator.Validate(s, now)
 	if verdict.Accept {
 		p.estimator.Apply(s)
@@ -89,6 +95,7 @@ func (p *Pipeline) Ingest(s sensor.Sample, now time.Time) sensor.Verdict {
 func (p *Pipeline) Evaluate(units []budget.Unit, now time.Time) Report {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.now = now
 
 	rep := Report{At: now, Rejected: []RejectedSample{}}
 
@@ -122,11 +129,23 @@ func (p *Pipeline) Release(unitID string) float64 {
 	return p.manager.Release(unitID)
 }
 
+// RequestBoost 发起一次短时功率增援（超车、避障等短时峰值场景）：
+// 窗口内该单元以临时优先级占用预算，可从优先级更低的单元挤占额度；
+// 窗口结束（由管线时钟驱动）或主动 Release 后，被挤占额度按原申请归还。
+// 增援始终受当前限功率结论约束；预算收紧时按优先级从低到高统一回收。
+func (p *Pipeline) RequestBoost(spec budget.BoostSpec, now time.Time) budget.Grant {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.now = now
+	return p.manager.RequestBoost(spec)
+}
+
 // Recover 在喂入新的有效样本后重新评估，用于从故障中恢复。
 // 若当前估计仍无效，保持安全零输出态并原样返回结论。
 func (p *Pipeline) Recover(now time.Time) limits.Decision {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.now = now
 	est := p.estimator.Estimate(now)
 	dec := p.engine.Evaluate(est)
 	p.manager.SetBudget(dec.PowerLimitW)
@@ -150,4 +169,6 @@ func (p *Pipeline) Reset(now time.Time) {
 	p.estimator.Reset(p.cfg.InitialSOC)
 	p.engine = limits.NewEngine(p.cfg.RatedPowerW, p.cfg.RatedTorqueNm)
 	p.manager = budget.NewManager(p.cfg.RatedPowerW)
+	p.now = now
+	p.manager.SetClock(func() time.Time { return p.now })
 }

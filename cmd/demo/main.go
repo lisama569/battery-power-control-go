@@ -66,6 +66,9 @@ func printReport(tag string, r pipeline.Report) {
 	for _, g := range r.Allocation.Granted {
 		fmt.Printf("  grant %-6s %-8s %8.1fW  (%s)\n", g.UnitID, g.Status, g.PowerW, g.Reason)
 	}
+	for _, b := range r.Allocation.Boosts {
+		fmt.Printf("  boost %-6s pri=%d %8.1fW  expires=%s\n", b.UnitID, b.Priority, b.PowerW, b.ExpiresAt.Format("15:04:05.000"))
+	}
 	for _, fv := range r.Freshness {
 		fmt.Printf("  freshness: %s %s (%s)\n", fv.Sample.Channel, fv.Reason, fv.Detail)
 	}
@@ -120,4 +123,32 @@ func main() {
 		src.feedHealthy(p, temp, 380, at2)
 	}
 	printReport("recovered to 40C", p.Evaluate(units, rec.Add(31*time.Millisecond)))
+
+	// 场景 6：短时功率增援——抢占、收紧回收、到期归还。
+	fmt.Println("########## scenario 6: short-term power boost ##########")
+	p.Reset(t0)
+	src.reset()
+	tb := t0.Add(100 * time.Millisecond)
+	src.feedHealthy(p, 30, 380, tb)
+	printReport("pre-boost nominal", p.Evaluate(units, tb.Add(5*time.Millisecond)))
+
+	// 超车增援：40000W / 窗口 1.5s / 临时优先级 0（最高），从低优先级单元挤占。
+	g := p.RequestBoost(budget.BoostSpec{
+		Unit:     budget.Unit{ID: "overtake", Priority: 1, RequestW: 40000, MinW: 10000},
+		Priority: 0,
+		TTL:      1500 * time.Millisecond,
+	}, tb.Add(10*time.Millisecond))
+	fmt.Printf("boost request: status=%s power=%.1fW (%s)\n\n", g.Status, g.PowerW, g.Reason)
+	printReport("boost active (preempted lower priorities)", p.Evaluate(nil, tb.Add(15*time.Millisecond)))
+
+	// 窗口内温度恶化到 60C：上限收紧到 105000W，按优先级从低到高回收，增援最后被触及。
+	src.feedHealthy(p, 45, 380, tb.Add(100*time.Millisecond))
+	src.feedHealthy(p, 60, 380, tb.Add(110*time.Millisecond))
+	printReport("tightened to 60C mid-boost", p.Evaluate(nil, tb.Add(120*time.Millisecond)))
+
+	// 窗口到期：温度回落（步长 <= 15C 跳变限），被挤占单元按原申请归还，
+	// 分配回到增援前的状态，如同增援从未发生。
+	src.feedHealthy(p, 45, 380, tb.Add(1400*time.Millisecond))
+	src.feedHealthy(p, 30, 380, tb.Add(1410*time.Millisecond))
+	printReport("boost expired -> restored", p.Evaluate(units, tb.Add(1520*time.Millisecond)))
 }
