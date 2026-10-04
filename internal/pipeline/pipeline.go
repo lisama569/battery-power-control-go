@@ -45,6 +45,8 @@ type Report struct {
 	Allocation budget.Allocation
 	Rejected   []RejectedSample
 	Freshness  []sensor.Verdict // 本轮评估时各通道缺失/陈旧情况
+	// ExpiredBoosts 是本轮评估中到期归还的增援单元（按 ID 升序）。
+	ExpiredBoosts []string
 }
 
 // Pipeline 持有整条管线的状态。Evaluate 全程持锁，
@@ -102,10 +104,29 @@ func (p *Pipeline) Evaluate(units []budget.Unit, now time.Time) Report {
 	dec := p.engine.Evaluate(est)
 	rep.Decision = dec
 
-	// 结论决定可支配总预算；零输出故障时预算为 0。
-	p.manager.SetBudget(dec.PowerLimitW)
+	// 先结算到期增援（归还被挤占额度），再把总预算对齐到最新限功率结论
+	// （收紧时按优先级从低到高回收，剩余额度不为负），最后做本轮分配。
+	// 三步在同一临界区内完成，外部看到的结论、预算、快照始终一致。
+	rep.ExpiredBoosts = p.manager.ExpireBoosts(now)
+	p.manager.ApplyBudget(dec.PowerLimitW, now)
 	rep.Allocation = p.manager.Allocate(units)
 	return rep
+}
+
+// RequestBoost 为单元发起一段有时限的功率增援（如超车、避障）：
+// 窗口内其有效优先级被临时抬高，可从更低优先级单元挤占额度；
+// 窗口到期（下一次 Evaluate/ExpireBoosts）或 StopBoost 后自动归还。
+func (p *Pipeline) RequestBoost(u budget.Unit, spec budget.BoostSpec, now time.Time) budget.Grant {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.manager.StartBoost(u, spec, now)
+}
+
+// StopBoost 提前结束单元的增援并立即归还被挤占额度（幂等）。
+func (p *Pipeline) StopBoost(unitID string, now time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.manager.StopBoost(unitID, now)
 }
 
 // Request 单独申请/调整一个单元的预留（使用当前限功率预算）。
@@ -124,12 +145,13 @@ func (p *Pipeline) Release(unitID string) float64 {
 
 // Recover 在喂入新的有效样本后重新评估，用于从故障中恢复。
 // 若当前估计仍无效，保持安全零输出态并原样返回结论。
+// 预算恢复时立即重算：故障期间被回收的登记按优先级干净复原，不留残留占用。
 func (p *Pipeline) Recover(now time.Time) limits.Decision {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	est := p.estimator.Estimate(now)
 	dec := p.engine.Evaluate(est)
-	p.manager.SetBudget(dec.PowerLimitW)
+	p.manager.ApplyBudget(dec.PowerLimitW, now)
 	return dec
 }
 

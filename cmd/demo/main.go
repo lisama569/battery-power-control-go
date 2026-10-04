@@ -66,6 +66,13 @@ func printReport(tag string, r pipeline.Report) {
 	for _, g := range r.Allocation.Granted {
 		fmt.Printf("  grant %-6s %-8s %8.1fW  (%s)\n", g.UnitID, g.Status, g.PowerW, g.Reason)
 	}
+	for _, b := range r.Allocation.ActiveBoosts {
+		fmt.Printf("  boost  %-6s +%8.1fW prio=%d until %s\n",
+			b.UnitID, b.ExtraW, b.Priority, b.ExpiresAt.Format("15:04:05.000"))
+	}
+	if len(r.ExpiredBoosts) > 0 {
+		fmt.Printf("  expired boosts returned this round: %v\n", r.ExpiredBoosts)
+	}
 	for _, fv := range r.Freshness {
 		fmt.Printf("  freshness: %s %s (%s)\n", fv.Sample.Channel, fv.Reason, fv.Detail)
 	}
@@ -120,4 +127,31 @@ func main() {
 		src.feedHealthy(p, temp, 380, at2)
 	}
 	printReport("recovered to 40C", p.Evaluate(units, rec.Add(31*time.Millisecond)))
+
+	// 场景 6：短时功率增援——抢占低优先级额度、限功率中途收紧回收、窗口到期归还。
+	fmt.Println("########## scenario 6: temporary power boost ##########")
+	p.Reset(t0)
+	src.reset()
+	at = t0.Add(100 * time.Millisecond)
+	src.feedHealthy(p, 30, 380, at)
+	now := at.Add(5 * time.Millisecond)
+	printReport("baseline before boost", p.Evaluate(units, now))
+
+	// drive 发起超车增援：+30kW，临时优先级 0，窗口 200ms。
+	bg := p.RequestBoost(budget.Unit{ID: "drive", Priority: 1, RequestW: 120000, MinW: 40000},
+		budget.BoostSpec{ExtraW: 30000, Priority: 0, TTL: 200 * time.Millisecond}, now)
+	fmt.Printf("boost requested: drive status=%s power=%.1fW (%s)\n\n", bg.Status, bg.PowerW, bg.Reason)
+	printReport("boost active: lower priorities preempted", p.Evaluate(units, now.Add(10*time.Millisecond)))
+
+	// 窗口未结束，温度升至 60C：限功率收紧到 105kW，按优先级从低到高回收。
+	for i, temp := range []float64{45, 60} {
+		src.feedHealthy(p, temp, 380, now.Add(time.Duration(20+i*10)*time.Millisecond))
+	}
+	printReport("limit tightened to 105kW mid-window", p.Evaluate(units, now.Add(50*time.Millisecond)))
+
+	// 温度回落且评估时钟越过窗口：到期归还，整体如同增援未发生。
+	for i, temp := range []float64{45, 30} {
+		src.feedHealthy(p, temp, 380, now.Add(time.Duration(150+i*10)*time.Millisecond))
+	}
+	printReport("boost expired: budget handed back", p.Evaluate(units, now.Add(210*time.Millisecond)))
 }
